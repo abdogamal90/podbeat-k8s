@@ -60,7 +60,7 @@ PODLITE_ALLOW_WRITES=1 ./podlite.sh
 
 | Tab | Shows |
 |---|---|
-| **pods** | status, ready, restarts, **last restart + reason**, **up** (container uptime), cpu/mem, node, age. Filters: problems / restarted <24h / crashloop+oom / not ready |
+| **pods** | status, ready, restarts, **last restart + reason**, **up** (container uptime), cpu/mem, node, age. Sorted by **up, newest first** (just restarted = top of the list); click any header to re-sort. Filters: problems / restarted <24h / crashloop+oom / not ready |
 | **nodes** | instance type, node group, spot vs on-demand, AZ, pod count, restarts, cpu/mem |
 | **deploys** | ready/desired, image, strategy |
 | **services** | type, cluster IP, ports, selector, external LB |
@@ -112,7 +112,8 @@ deploys tab.
 
 `up` vs `age`: **up** = how long the current container has been running,
 **age** = how long the pod object has existed. A pod that restarted 5m ago out
-of a 3-day-old pod shows `up 5m` / `age 3d`.
+of a 3-day-old pod shows `up 5m` / `age 3d`. The table is ordered by `up`
+ascending, so whatever started most recently sits at the top.
 
 ## Keyboard (the whole point for an impatient human)
 

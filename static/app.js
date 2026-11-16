@@ -26,7 +26,7 @@ const state = {
   lastRestartSeq: null,
   restartCount: 0,
   logAbort: null,
-  sort: { pods: { key: '__smart', dir: 1 }, default: { key: 'name', dir: 1 } },
+  sort: { pods: { key: 'upSec', dir: 1 }, default: { key: 'name', dir: 1 } },
   tick: 0,
   stuck: false,
 };
@@ -61,7 +61,11 @@ function fmtDur(sec) {
   if (!sec || sec < 0) return '-';
   if (sec < 100) return sec + 's';
   if (sec < 3600) return Math.floor(sec / 60) + 'm';
-  if (sec < 86400) return Math.floor(sec / 3600) + 'h' + (Math.floor(sec % 3600 / 60) || '') + 'm';
+  if (sec < 86400) {
+    const hours = Math.floor(sec / 3600);
+    const mins = Math.floor((sec % 3600) / 60);
+    return hours + 'h' + (mins ? mins + 'm' : '');
+  }
   return Math.floor(sec / 86400) + 'd';
 }
 
@@ -282,32 +286,22 @@ function bindTable(handler) {
 function sortRows(rows, key, dir) {
   const arr = rows.slice();
   arr.sort((a, b) => {
-    if (key === '__smart') {
-      // what deserves your eyes first: broken > restarted very recently > restarted today
-      const rank = (r) => {
-        if (isProblem(r.status)) return 0;
-        const ago = r.lastRestartAgoSec || 0;
-        if (ago && ago < 3600) return 1;
-        if (ago && ago < 86400) return 2;
-        if (r.restarts > 0) return 3;
-        return 4;
-      };
-      const d = rank(a) - rank(b);
-      if (d) return d;
-      const aa = a.lastRestartAgoSec || Infinity;
-      const bb = b.lastRestartAgoSec || Infinity;
-      if (aa !== bb) return aa - bb;
-      if (b.restarts !== a.restarts) return b.restarts - a.restarts;
-      return a.name.localeCompare(b.name);
-    }
     const av = a[key], bv = b[key];
-    if (av == null && bv == null) return 0;
+    if (av == null && bv == null) return tiebreak(a, b);
     if (av == null) return 1;
     if (bv == null) return -1;
-    if (typeof av === 'number' && typeof bv === 'number') return (av - bv) * dir;
-    return String(av).localeCompare(String(bv)) * dir;
+    const delta = typeof av === 'number' && typeof bv === 'number'
+      ? av - bv
+      : String(av).localeCompare(String(bv));
+    return delta !== 0 ? delta * dir : tiebreak(a, b);
   });
   return arr;
+}
+
+// stable, readable order when the sorted column has equal values
+function tiebreak(a, b) {
+  if (!a.name || !b.name) return 0;
+  return a.name.localeCompare(b.name);
 }
 
 function isProblem(status) {
