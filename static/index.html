@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>podlite</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>🥔</text></svg>">
+</head>
+<body>
+<header>
+  <span class="brand">podlite</span>
+  <select id="ctx" title="kubectl context"></select>
+  <select id="ns" title="namespace"></select>
+  <input id="search" type="search" placeholder="filter…  (press /)" autocomplete="off" spellcheck="false">
+  <span id="writes" class="pill" title="write mode"></span>
+  <button id="refresh" class="btn" title="refresh (r)">refresh</button>
+  <span id="clock" class="muted"></span>
+</header>
+
+<nav id="tabs">
+  <button data-tab="pods" class="active">pods <em id="n-pods"></em></button>
+  <button data-tab="nodes">nodes</button>
+  <button data-tab="deployments">deploys</button>
+  <button data-tab="services">services</button>
+  <button data-tab="configmaps">configmaps</button>
+  <button data-tab="secrets">secrets</button>
+  <button data-tab="events">events</button>
+  <button data-tab="restarts">restarts <em id="n-restarts"></em></button>
+  <span class="spacer"></span>
+  <span id="fwdbar" class="forwards"></span>
+</nav>
+
+<div id="banner" class="banner" hidden></div>
+
+<main id="view"><div class="empty">loading…</div></main>
+
+<aside id="drawer" hidden>
+  <div class="drawer-head">
+    <div class="drawer-id">
+      <div class="drawer-title" id="d-title"></div>
+      <div class="drawer-sub" id="d-sub"></div>
+    </div>
+    <div class="drawer-buttons">
+      <button class="btn ghost" id="d-collapse" title="collapse panel (c)">»</button>
+      <button class="btn ghost" id="d-close" title="close (esc)">✕</button>
+    </div>
+  </div>
+  <div class="drawer-tabs" id="d-tabs"></div>
+  <div class="drawer-body" id="d-body"></div>
+  <div class="drawer-rail">
+    <button class="btn ghost" id="d-expand" title="expand panel (c)">«</button>
+    <span class="rail-title" id="d-rail-title"></span>
+  </div>
+</aside>
+
+<div id="modal" class="modal" hidden>
+  <div class="modal-box" role="dialog" aria-modal="true">
+    <div class="modal-title" id="modal-title"></div>
+    <div class="modal-body" id="modal-body"></div>
+    <div class="modal-actions">
+      <button class="btn" id="modal-cancel">cancel</button>
+      <button class="btn bad" id="modal-ok">confirm</button>
+    </div>
+  </div>
+</div>
+
+<div id="toasts"></div>
+
+<footer>
+  <span><kbd>/</kbd> filter</span>
+  <span><kbd>1</kbd>–<kbd>8</kbd> tabs</span>
+  <span><kbd>j</kbd><kbd>k</kbd> move</span>
+  <span><kbd>enter</kbd> open</span>
+  <span><kbd>l</kbd> logs</span>
+  <span><kbd>y</kbd> yaml</span>
+  <span><kbd>esc</kbd> close</span>
+  <span><kbd>c</kbd> collapse</span>
+  <span><kbd>r</kbd> refresh</span>
+  <span class="muted" id="hint"></span>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

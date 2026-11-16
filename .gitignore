@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.log
+
+# local state (restart history, server log) lives in ~/.podlite, never here
+.podlite/
+*.jsonl
+
+.venv/
+venv/
+.DS_Store
