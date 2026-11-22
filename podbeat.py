@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-podlite - a dumb, tiny kubectl dashboard.
+podbeat - a dumb, tiny kubectl dashboard.
 
 One file, stdlib only. It shells out to kubectl (so EKS auth / kubeconfig
 just work) and serves a single-page UI. No build step, no Electron, no CRD
 zoo. If it needs explaining, it's too clever.
 
-    ./podlite.sh                 # http://127.0.0.1:8484
-    PODLITE_ALLOW_WRITES=1 ./podlite.sh   # unlock delete / restart / exec
+    ./podbeat.sh                 # http://127.0.0.1:8484
+    PODBEAT_ALLOW_WRITES=1 ./podbeat.sh   # unlock delete / restart / exec
 
 Env knobs:
-    PODLITE_PORT=8484
-    PODLITE_KUBECTL=kubectl
-    PODLITE_TIMEOUT=25                 # seconds per kubectl call
-    PODLITE_ALLOW_WRITES=0             # destructive actions + exec
-    PODLITE_WATCH_NAMESPACES=default   # background restart watcher
-    PODLITE_HOME=~/.podlite            # restart history file
+    PODBEAT_PORT=8484
+    PODBEAT_KUBECTL=kubectl
+    PODBEAT_TIMEOUT=25                 # seconds per kubectl call
+    PODBEAT_ALLOW_WRITES=0             # destructive actions + exec
+    PODBEAT_WATCH_NAMESPACES=default   # background restart watcher
+    PODBEAT_HOME=~/.podbeat            # restart history file
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ import base64
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import threading
@@ -42,18 +43,36 @@ from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
-PORT = int(os.environ.get("PODLITE_PORT", "8484"))
-KUBECTL = os.environ.get("PODLITE_KUBECTL", "kubectl")
-TIMEOUT = int(os.environ.get("PODLITE_TIMEOUT", "25"))
-ALLOW_WRITES = os.environ.get("PODLITE_ALLOW_WRITES", "0") == "1"
+VERSION = "0.1.0"
+PORT = int(os.environ.get("PODBEAT_PORT", "8484"))
+KUBECTL = os.environ.get("PODBEAT_KUBECTL", "kubectl")
+TIMEOUT = int(os.environ.get("PODBEAT_TIMEOUT", "25"))
+ALLOW_WRITES = os.environ.get("PODBEAT_ALLOW_WRITES", "0") == "1"
+# context names matching this get the PRODUCTION marker in the UI; empty = never
+PROD_PATTERN = os.environ.get("PODBEAT_PROD_PATTERN", "prod")
 WATCH_NAMESPACES = [
     n.strip()
-    for n in os.environ.get("PODLITE_WATCH_NAMESPACES", "default").split(",")
+    for n in os.environ.get("PODBEAT_WATCH_NAMESPACES", "default").split(",")
     if n.strip()
 ]
-HOME_DIR = Path(os.environ.get("PODLITE_HOME", Path.home() / ".podlite"))
+HOME_DIR = Path(os.environ.get("PODBEAT_HOME", Path.home() / ".podbeat"))
 HISTORY_FILE = HOME_DIR / "restarts.jsonl"
 HISTORY_MAX = 2000
+
+# --- request gate ---------------------------------------------------------
+# The server listens on 127.0.0.1 only, but that alone does not stop other
+# websites: a page on the internet can still POST to 127.0.0.1:8484 (a CSRF
+# "simple request" needs no preflight), and DNS rebinding can make a hostile
+# domain resolve to 127.0.0.1 and then READ responses. So every request must:
+#   1. carry a Host we issued (kills DNS rebinding),
+#   2. carry no foreign Origin (kills cross-site requests),
+#   3. present the per-launch token (kills CSRF even if 1-2 regress).
+ALLOWED_HOSTS = {
+    f"127.0.0.1:{PORT}", f"localhost:{PORT}",
+    "127.0.0.1", "localhost",
+}
+TOKEN = secrets.token_urlsafe(32)
+CSP = "default-src 'self'; img-src 'self' data:; frame-ancestors 'self'"
 
 # resource plural -> kubectl resource arg. Anything not listed is refused.
 KINDS = {
@@ -84,7 +103,7 @@ CONFIG_KEY_RE = re.compile(r"^[-._a-zA-Z0-9]+$")
 # --------------------------------------------------------------------------
 
 def log(msg: str) -> None:
-    print(f"[podlite] {msg}", flush=True)
+    print(f"[podbeat] {msg}", flush=True)
 
 
 def parse_quantity(q) -> float:
@@ -150,11 +169,74 @@ class KubeError(Exception):
         self.status = status
 
 
+# --- input validation ------------------------------------------------------
+# Every user-controlled string that reaches kubectl argv must pass one of
+# these. Without it, values like "--kubeconfig=..." become kubectl flags.
+
+# DNS-1123 subdomain: pod/configmap/service names (allows dots for subdomains)
+NAME_RE = re.compile(r"^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$")
+# DNS-1123 label: namespaces
+NS_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+# contexts and container names are more relaxed, but never flag-shaped
+SAFE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/-]*$")
+
+
+def require(value: str, pattern: re.Pattern, what: str, limit: int = 253) -> str:
+    text = str(value or "")
+    if not text or len(text) > limit or not pattern.match(text):
+        raise KubeError(f"invalid {what}", 400)
+    return text
+
+
+def valid_name(value: str, what: str = "name") -> str:
+    return require(value, NAME_RE, what)
+
+
+def valid_namespace(value: str) -> str:
+    return require(value, NS_RE, "namespace", limit=63)
+
+
+def valid_context(value: str) -> str:
+    return require(value, SAFE_RE, "context", limit=256)
+
+
+def valid_container(value: str) -> str:
+    return require(value, SAFE_RE, "container", limit=63)
+
+
+def valid_kind(kind: str) -> str:
+    if kind not in ("deployment", "statefulset", "daemonset"):
+        raise KubeError(f"unsupported kind for this action: {kind}", 400)
+    return kind
+
+
+def valid_tail(value) -> int:
+    try:
+        tail = int(value)
+    except (TypeError, ValueError):
+        raise KubeError("tail must be an integer", 400)
+    return min(max(tail, 1), 50000)
+
+
+def clamp_int(value, lo: int, hi: int, default: int | None = None) -> int:
+    """Bounded integer for query fields; bad input is a 400, not a 500."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        if default is None:
+            raise KubeError("value must be an integer", 400)
+        number = default
+    return min(max(number, lo), hi)
+
+
+MAX_BODY_BYTES = 2 * 1024 * 1024  # a configmap editor payload never needs more
+
+
 def friendly_error(stderr: str) -> str:
     text = (stderr or "").strip()
     low = text.lower()
     if "expired" in low or ("sso" in low and "token" in low):
-        return "AWS session expired. Run: aws sso login --profile ProdViewOnlyAccess-188113730724"
+        return "cloud session expired. Re-authenticate (e.g. aws sso login) and retry."
     if "get-token" in low or "exec plugin" in low:
         return "kubectl auth plugin failed (aws eks get-token). Re-run aws sso login."
     if "connection refused" in low or "dial tcp" in low or "no such host" in low:
@@ -256,27 +338,43 @@ class RestartTracker:
         if not HISTORY_FILE.exists():
             return
         try:
-            lines = HISTORY_FILE.read_text().splitlines()[-HISTORY_MAX:]
+            lines = HISTORY_FILE.read_text().splitlines()
         except OSError:
             return
+        if len(lines) > HISTORY_MAX:
+            # bound the append-only file so it cannot grow forever
+            self._rewrite_history(lines[-HISTORY_MAX:])
+            lines = lines[-HISTORY_MAX:]
         for line in lines:
             try:
                 ev = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            self._seq = max(self._seq, int(ev.get("seq", 0)))
-            self._events.append(ev)
-            # seed what we already know so a podlite restart doesn't re-record
-            # the same container state as brand new history
-            key = (ev.get("ctx"), ev.get("ns"), ev.get("pod"), ev.get("container"))
-            self._prev[key] = max(int(ev.get("total") or 0), self._prev.get(key, 0))
+                self._seq = max(self._seq, int(ev.get("seq") or 0))
+                # seed what we already know so a podbeat restart doesn't re-record
+                # the same container state as brand new history
+                key = (ev.get("ctx"), ev.get("ns"), ev.get("pod"), ev.get("container"))
+                self._prev[key] = max(int(ev.get("total") or 0), self._prev.get(key, 0))
+                self._events.append(ev)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue  # one corrupt line must never stop the server
         log(f"loaded {len(self._events)} restart events from {HISTORY_FILE}")
+
+    def _rewrite_history(self, lines: list[str]) -> None:
+        """Bound the history file to its last HISTORY_MAX lines, once at load."""
+        try:
+            HISTORY_FILE.write_text("\n".join(lines) + "\n")
+            HISTORY_FILE.chmod(0o600)
+        except OSError as exc:
+            log(f"could not compact history: {exc}")
 
     def _append(self, ev: dict):
         try:
             HOME_DIR.mkdir(parents=True, exist_ok=True)
+            HOME_DIR.chmod(0o700)
+            existed = HISTORY_FILE.exists()
             with HISTORY_FILE.open("a") as fh:
                 fh.write(json.dumps(ev) + "\n")
+            if not existed:
+                HISTORY_FILE.chmod(0o600)  # pod/node topology stays owner-only
         except OSError as exc:
             log(f"could not persist restart history: {exc}")
 
@@ -726,10 +824,21 @@ FORWARDS = PortForwards()
 # --------------------------------------------------------------------------
 
 def current_context() -> str:
+    """Cached briefly: /api/health is token-exempt, so uncached calls would let
+    any website churn one kubectl subprocess per request."""
+    global _current_context_cache
+    cached_at, cached_ctx = _current_context_cache
+    if time.time() - cached_at < 5.0:
+        return cached_ctx
     try:
-        return kubectl(["config", "current-context"], timeout=10).strip()
+        ctx = kubectl(["config", "current-context"], timeout=10).strip()
     except KubeError:
         return ""
+    _current_context_cache = (time.time(), ctx)
+    return ctx
+
+
+_current_context_cache = (0.0, "")
 
 
 def background_watcher():
@@ -754,12 +863,36 @@ def background_watcher():
 # --------------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "podlite"
+    server_version = "podbeat"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):  # quieter logs
         if "/api/" not in (args[0] if args else ""):
             return
+
+    # -- request gate ------------------------------------------------------
+    def check_request(self) -> None:
+        """
+        Reject anything that is not from the podbeat UI running on this
+        machine. Host mismatch = DNS rebinding; foreign Origin = cross-site
+        request; missing token = CSRF. /api/health is the only /api path
+        allowed without a token, because it is where the UI fetches the token.
+        """
+        host = (self.headers.get("Host") or "").strip().lower()
+        if host not in ALLOWED_HOSTS:
+            raise KubeError("forbidden host", 403)
+        origin = self.headers.get("Origin")
+        if origin:
+            origin_host = urlparse(origin).hostname or ""
+            if origin_host not in ("127.0.0.1", "localhost"):
+                raise KubeError("forbidden origin", 403)
+        path = urlparse(self.path).path
+        if path == "/api/health":
+            return
+        if path.startswith("/api/"):
+            token = self.headers.get("X-Podbeat-Token", "")
+            if not token or not secrets.compare_digest(token, TOKEN):
+                raise KubeError("missing or invalid token", 403)
 
     # -- plumbing -----------------------------------------------------------
     def _json(self, payload, status=200):
@@ -768,6 +901,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy", CSP)
         self.end_headers()
         self.wfile.write(body)
 
@@ -777,6 +911,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy", CSP)
         self.end_headers()
         self.wfile.write(data)
 
@@ -790,6 +925,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         try:
+            self.check_request()
             if path == "/":
                 return self._serve_file("index.html", "text/html; charset=utf-8")
             if path.startswith("/static/"):
@@ -797,20 +933,25 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/health":
                 return self._json({
                     "ok": True,
+                    "app": "podbeat",
+                    "version": VERSION,
                     "writes": ALLOW_WRITES,
+                    "prodPattern": PROD_PATTERN,
                     "context": current_context(),
                     "watch": WATCH_NAMESPACES,
+                    "token": TOKEN,
                 })
             if path == "/api/contexts":
                 return self._json(self.contexts())
             if path == "/api/namespaces":
-                return self._json(self.namespaces(self._q().get("ctx")))
+                ctx = valid_context(self._q().get("ctx") or current_context())
+                return self._json(self.namespaces(ctx))
             if path == "/api/pods":
                 return self._json(self.pods(self._q()))
             if path == "/api/nodes":
                 q = self._q()
-                ctx = q.get("ctx") or current_context()
-                ns = q.get("ns") or "default"
+                ctx = valid_context(q.get("ctx") or current_context())
+                ns = valid_namespace(q.get("ns") or "default")
                 pods = self.pods({"ctx": ctx, "ns": ns}).get("pods", [])
                 rows, note = node_rows(ctx, pods)
                 return self._json({"nodes": rows, "note": note, "ts": int(time.time())})
@@ -819,8 +960,8 @@ class Handler(BaseHTTPRequestHandler):
                 kind = q.get("kind", "")
                 if kind not in KINDS:
                     return self._json({"error": f"unsupported kind: {kind}"}, 400)
-                ctx = q.get("ctx") or current_context()
-                ns = q.get("ns") or "default"
+                ctx = valid_context(q.get("ctx") or current_context())
+                ns = valid_namespace(q.get("ns") or "default")
                 rows = generic_rows(kind, ctx, ns)
                 return self._json({"kind": kind, "rows": rows, "ts": int(time.time())})
             if path == "/api/object":
@@ -837,8 +978,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.stream_logs(self._q())
             if path == "/api/restarts":
                 q = self._q()
-                after = int(q.get("after", 0))
-                limit = int(q.get("limit", 200))
+                after = clamp_int(q.get("after", 0), 0, 10**9)
+                limit = clamp_int(q.get("limit", 200), 1, 2000)
                 return self._json({
                     "events": RESTARTS.since(after, limit),
                     "latest": RESTARTS.latest_seq(),
@@ -853,13 +994,21 @@ class Handler(BaseHTTPRequestHandler):
             return
         except Exception as exc:  # noqa: BLE001 - surface, never crash the server
             log(f"error on {path}: {type(exc).__name__}: {exc}")
-            return self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
+            return self._json({"error": "internal error (see server log)"}, 500)
 
     def do_POST(self):
         path = urlparse(self.path).path
         try:
+            self.check_request()
+            ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if ctype != "application/json":
+                return self._json({"error": "content-type must be application/json"}, 415)
             length = int(self.headers.get("Content-Length") or 0)
+            if length > MAX_BODY_BYTES:
+                return self._json({"error": "request body too large"}, 413)
             body = json.loads(self.rfile.read(length) or b"{}")
+        except KubeError as exc:
+            return self._fail(exc)
         except (ValueError, json.JSONDecodeError):
             return self._json({"error": "bad JSON body"}, 400)
         try:
@@ -869,11 +1018,11 @@ class Handler(BaseHTTPRequestHandler):
                 if not ALLOW_WRITES:
                     return self._json({"error": "port-forward is disabled in read-only mode"}, 403)
                 return self._json(FORWARDS.start(
-                    body.get("ctx") or current_context(),
-                    body.get("ns") or "default",
-                    body["pod"], body["ports"]))
+                    valid_context(body.get("ctx") or current_context()),
+                    valid_namespace(body.get("ns") or "default"),
+                    valid_name(body["pod"], "pod"), body["ports"]))
             if path == "/api/forwards/stop":
-                return self._json({"stopped": FORWARDS.stop(int(body.get("id", 0)))})
+                return self._json({"stopped": FORWARDS.stop(clamp_int(body.get("id", 0), 0, 10**9, default=0))})
             return self._json({"error": "not found"}, 404)
         except KubeError as exc:
             return self._fail(exc)
@@ -881,12 +1030,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": f"missing field: {exc}"}, 400)
         except Exception as exc:  # noqa: BLE001
             log(f"error on {path}: {type(exc).__name__}: {exc}")
-            return self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
+            return self._json({"error": "internal error (see server log)"}, 500)
 
     # -- handlers -----------------------------------------------------------
     def _serve_file(self, name: str, ctype: str | None = None):
         target = (STATIC / name).resolve()
-        if not str(target).startswith(str(STATIC.resolve())) or not target.is_file():
+        if not target.is_relative_to(STATIC.resolve()) or not target.is_file():
             return self._json({"error": "not found"}, 404)
         if ctype is None:
             ctype = {
@@ -899,6 +1048,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy", CSP)
         self.end_headers()
         self.wfile.write(body)
 
@@ -930,8 +1080,8 @@ class Handler(BaseHTTPRequestHandler):
         return payload
 
     def pods(self, q: dict):
-        ctx = q.get("ctx") or current_context()
-        ns = q.get("ns") or "default"
+        ctx = valid_context(q.get("ctx") or current_context())
+        ns = valid_namespace(q.get("ns") or "default")
         # pods + metrics are independent kubectl calls; run them together
         with ThreadPoolExecutor(max_workers=2) as pool:
             metrics_future = pool.submit(pod_metrics, ctx, ns)
@@ -961,11 +1111,9 @@ class Handler(BaseHTTPRequestHandler):
         kind = q.get("kind", "pods")
         if kind not in KINDS:
             raise KubeError(f"unsupported kind: {kind}", 400)
-        ctx = q.get("ctx") or current_context()
-        ns = None if kind in CLUSTER_SCOPED else (q.get("ns") or "default")
-        name = q.get("name", "")
-        if not name:
-            raise KubeError("missing name", 400)
+        ctx = valid_context(q.get("ctx") or current_context())
+        ns = None if kind in CLUSTER_SCOPED else valid_namespace(q.get("ns") or "default")
+        name = valid_name(q.get("name", ""))
         return ctx, kind, name, ns
 
     def object_detail(self, q: dict):
@@ -993,11 +1141,12 @@ class Handler(BaseHTTPRequestHandler):
         return kubectl(["describe", KINDS[kind], name], ctx=ctx, ns=ns)
 
     def stream_logs(self, q: dict):
-        ctx = q.get("ctx") or current_context()
-        ns = q.get("ns") or "default"
-        pod = q.get("pod") or ""
-        container = q.get("container") or None
-        tail = q.get("tail") or "300"
+        ctx = valid_context(q.get("ctx") or current_context())
+        ns = valid_namespace(q.get("ns") or "default")
+        pod = valid_name(q.get("pod", ""), "pod")
+        raw_container = q.get("container") or ""
+        container = valid_container(raw_container) if raw_container else None
+        tail = valid_tail(q.get("tail") or "300")
         follow = q.get("follow") == "1"
         previous = q.get("previous") == "1"
         timestamps = q.get("timestamps") == "1"
@@ -1034,7 +1183,7 @@ class Handler(BaseHTTPRequestHandler):
             pass
         except Exception as exc:  # noqa: BLE001
             try:
-                chunk(f"\n[podlite] stream error: {exc}\n".encode())
+                chunk(f"\n[podbeat] stream error: {exc}\n".encode())
             except OSError:
                 return
         finally:
@@ -1050,51 +1199,55 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def action(self, body: dict):
-        kind = body.get("action", "")
-        ctx = body.get("ctx") or current_context()
-        ns = body.get("ns") or "default"
+        action = body.get("action", "")
+        ctx = valid_context(body.get("ctx") or current_context())
+        ns = valid_namespace(body.get("ns") or "default")
 
-        if kind == "exec":
+        if action == "exec":
             if not ALLOW_WRITES:
-                raise KubeError("exec is disabled in read-only mode (PODLITE_ALLOW_WRITES=1)", 403)
-            pod = body.get("pod")
+                raise KubeError("exec is disabled in read-only mode (PODBEAT_ALLOW_WRITES=1)", 403)
+            pod = valid_name(body.get("pod") or "", "pod")
+            raw_container = body.get("container") or ""
+            container = valid_container(raw_container) if raw_container else None
             cmd = body.get("cmd") or ""
-            if not pod or not cmd:
-                raise KubeError("missing pod or cmd", 400)
+            if not cmd:
+                raise KubeError("missing cmd", 400)
             args = ["exec", pod]
-            if body.get("container"):
-                args += ["-c", body["container"]]
+            if container:
+                args += ["-c", container]
             args += ["--", "sh", "-c", cmd]
-            try:
-                out = kubectl(args, ctx=ctx, ns=ns, timeout=40, check=False)
-            except KubeError as exc:
-                raise exc
+            out = kubectl(args, ctx=ctx, ns=ns, timeout=40, check=False)
             return {"output": out}
 
         if not ALLOW_WRITES:
-            raise KubeError("action disabled in read-only mode (set PODLITE_ALLOW_WRITES=1)", 403)
+            raise KubeError("action disabled in read-only mode (set PODBEAT_ALLOW_WRITES=1)", 403)
 
-        if kind == "delete-pod":
-            out = kubectl(["delete", "pod", body["pod"], "--wait=false"], ctx=ctx, ns=ns, check=False)
+        if action == "delete-pod":
+            pod = valid_name(body.get("pod") or "", "pod")
+            out = kubectl(["delete", "pod", pod, "--wait=false"], ctx=ctx, ns=ns, check=False)
             CACHE.drop()
             return {"output": out}
 
-        if kind == "save-configmap":
+        if action == "save-configmap":
             return self.save_configmap(body, ctx, ns)
 
-        if kind == "rollout-restart":
-            out = kubectl(["rollout", "restart", body["kind"], body["name"]], ctx=ctx, ns=ns, check=False)
+        if action == "rollout-restart":
+            kind = valid_kind(body.get("kind") or "")
+            name = valid_name(body.get("name") or "")
+            out = kubectl(["rollout", "restart", kind, name], ctx=ctx, ns=ns, check=False)
             CACHE.drop()
             return {"output": out}
 
-        if kind == "scale":
+        if action == "scale":
+            kind = valid_kind(body.get("kind") or "")
+            name = valid_name(body.get("name") or "")
             replicas = str(int(body["replicas"]))
-            out = kubectl(["scale", body["kind"], body["name"], f"--replicas={replicas}"],
+            out = kubectl(["scale", kind, name, f"--replicas={replicas}"],
                           ctx=ctx, ns=ns, check=False)
             CACHE.drop()
             return {"output": out}
 
-        raise KubeError(f"unknown action: {kind}", 400)
+        raise KubeError(f"unknown action: {action}", 400)
 
     def save_configmap(self, body: dict, ctx: str, ns: str) -> dict:
         """
@@ -1103,7 +1256,7 @@ class Handler(BaseHTTPRequestHandler):
         Uses `kubectl replace` with the resourceVersion we read, so a concurrent
         edit fails loudly (409) instead of being silently overwritten.
         """
-        name = body.get("name") or ""
+        name = valid_name(body.get("name") or "", "configmap name")
         data = body.get("data")
         expected_rv = body.get("resourceVersion") or ""
         if not name:
@@ -1152,21 +1305,47 @@ class Handler(BaseHTTPRequestHandler):
         }
 
 
+def migrate_state() -> None:
+    """One-time move of ~/.podlite (the pre-rename state dir) to ~/.podbeat."""
+    old = Path.home() / ".podlite"
+    if HOME_DIR.is_dir() or not old.is_dir():
+        return
+    HOME_DIR.mkdir(parents=True, exist_ok=True)
+    for item in old.iterdir():
+        if item.is_file():
+            try:
+                item.rename(HOME_DIR / item.name)
+            except OSError:
+                pass
+    log(f"migrated state from {old} to {HOME_DIR}")
+
+
 def main():
     global PORT
     args = sys.argv[1:]
+    if args and args[0] in ("--version", "-v"):
+        print(f"podbeat {VERSION}")
+        return
     if "--open" in args:
         threading.Timer(0.8, lambda: webbrowser.open(f"http://127.0.0.1:{PORT}")).start()
     args = [a for a in args if a != "--open"]
     if args and args[0].isdigit():
         PORT = int(args[0])
+        # the port is part of the allowed Host list, rebuild it
+        globals()["ALLOWED_HOSTS"] = {
+            f"127.0.0.1:{PORT}", f"localhost:{PORT}", "127.0.0.1", "localhost",
+        }
 
     HOME_DIR.mkdir(parents=True, exist_ok=True)
+    HOME_DIR.chmod(0o700)
+    migrate_state()
+    if not PROD_PATTERN:
+        log("PODBEAT_PROD_PATTERN is empty: the PRODUCTION marker is disabled")
     threading.Thread(target=background_watcher, daemon=True).start()
 
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     server.daemon_threads = True
-    log(f"podlite on http://127.0.0.1:{PORT}  (writes={'ON' if ALLOW_WRITES else 'off'})")
+    log(f"podbeat on http://127.0.0.1:{PORT}  (writes={'ON' if ALLOW_WRITES else 'off'})")
     if not ALLOW_WRITES:
         log("read-only mode: delete / rollout restart / exec / port-forward are locked")
     try:

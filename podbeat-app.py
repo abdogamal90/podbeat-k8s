@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-podlite desktop app - the same tiny dashboard, in a native window.
+podbeat desktop app - the same tiny dashboard, in a native window.
 
-No Electron. This is a WebKitGTK window pointed at the podlite server, which
+No Electron. This is a WebKitGTK window pointed at the podbeat server, which
 it starts itself and stops when you close the window. If WebKitGTK is missing
 it falls back to a Chrome app window, then to your default browser.
 
-    podlite-app.py            # native window
-    podlite-app.py --browser  # force a browser window
-    podlite-app.py --check    # print what it would use, start/stop the server, exit
+    podbeat-app.py            # native window
+    podbeat-app.py --browser  # force a browser window
+    podbeat-app.py --check    # print what it would use, start/stop the server, exit
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import signal
@@ -24,11 +25,11 @@ import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SERVER = HERE / "podlite.py"
-PORT = int(os.environ.get("PODLITE_PORT", "8484"))
+SERVER = HERE / "podbeat.py"
+PORT = int(os.environ.get("PODBEAT_PORT", "8484"))
 URL = f"http://127.0.0.1:{PORT}/"
-APP_ID = "io.cartona.podlite"
-HOME_DIR = Path(os.environ.get("PODLITE_HOME", Path.home() / ".podlite"))
+APP_ID = "io.github.abdogamal90.podbeat"
+HOME_DIR = Path(os.environ.get("PODBEAT_HOME", Path.home() / ".podbeat"))
 SERVER_LOG = HOME_DIR / "server.log"
 START_TIMEOUT = 20.0
 WINDOW_SIZE = (1440, 900)
@@ -43,13 +44,13 @@ def configure_webkit_environment() -> str:
     process never starts and the page can never load.
 
     The UI only ever loads http://127.0.0.1:<port>, so the sandbox buys little
-    here. Disable it by default; PODLITE_WEB_SANDBOX=1 puts it back.
+    here. Disable it by default; PODBEAT_WEB_SANDBOX=1 puts it back.
     """
-    if os.environ.get("PODLITE_WEB_SANDBOX") == "1":
+    if os.environ.get("PODBEAT_WEB_SANDBOX") == "1":
         os.environ.pop("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", None)
-        return "web sandbox: on (PODLITE_WEB_SANDBOX=1)"
+        return "web sandbox: on (PODBEAT_WEB_SANDBOX=1)"
     os.environ["WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS"] = "1"
-    return "web sandbox: off (localhost-only UI; PODLITE_WEB_SANDBOX=1 to enable)"
+    return "web sandbox: off (localhost-only UI; PODBEAT_WEB_SANDBOX=1 to enable)"
 
 
 # --------------------------------------------------------------------------
@@ -57,9 +58,13 @@ def configure_webkit_environment() -> str:
 # --------------------------------------------------------------------------
 
 def healthy(timeout: float = 0.8) -> bool:
+    """True only if a *podbeat* backend answers on our port."""
     try:
         with urllib.request.urlopen(URL + "api/health", timeout=timeout) as res:
-            return res.status == 200
+            if res.status != 200:
+                return False
+            data = json.loads(res.read().decode() or "{}")
+            return data.get("app") == "podbeat"
     except Exception:
         return False
 
@@ -79,7 +84,7 @@ def _die_with_parent() -> None:
 def start_server() -> subprocess.Popen | None:
     """Start the backend unless one is already listening. Returns our child, or None."""
     if healthy():
-        print(f"podlite server already running on {URL} - attaching")
+        print(f"podbeat server already running on {URL} - attaching")
         return None
     if not SERVER.exists():
         raise SystemExit(f"missing {SERVER}")
@@ -97,12 +102,12 @@ def start_server() -> subprocess.Popen | None:
     deadline = time.time() + START_TIMEOUT
     while time.time() < deadline:
         if proc.poll() is not None:
-            raise SystemExit(f"podlite server exited immediately - see {SERVER_LOG}")
+            raise SystemExit(f"podbeat server exited immediately - see {SERVER_LOG}")
         if healthy():
             return proc
         time.sleep(0.15)
     proc.terminate()
-    raise SystemExit(f"podlite server did not come up in {START_TIMEOUT:.0f}s - see {SERVER_LOG}")
+    raise SystemExit(f"podbeat server did not come up in {START_TIMEOUT:.0f}s - see {SERVER_LOG}")
 
 
 def stop_server(proc: subprocess.Popen | None) -> None:
@@ -120,21 +125,17 @@ def stop_server(proc: subprocess.Popen | None) -> None:
 # --------------------------------------------------------------------------
 
 def detect_backend() -> str:
-    for name, gtk, version, module in (
-        ("gtk4", "4.0", "6.0", "WebKit"),
-        ("gtk3", "3.0", "4.1", "WebKit2"),
-    ):
-        try:
-            import gi  # optional dependency, probed at runtime
+    try:
+        import gi  # optional dependency, probed at runtime
 
-            gi.require_version("Gtk", gtk)
-            gi.require_version(module, version)
-            import importlib
+        gi.require_version("Gtk", "4.0")
+        gi.require_version("WebKit", "6.0")
+        import importlib
 
-            importlib.import_module(f"gi.repository.{module}")
-            return name
-        except Exception:
-            continue
+        importlib.import_module("gi.repository.WebKit")
+        return "gtk4"
+    except Exception:
+        pass
     return "browser"
 
 
@@ -145,8 +146,8 @@ def run_gtk4() -> None:
     gi.require_version("WebKit", "6.0")
     from gi.repository import Gdk, Gio, GLib, Gtk, WebKit
 
-    GLib.set_prgname("podlite")
-    GLib.set_application_name("podlite")
+    GLib.set_prgname("podbeat")
+    GLib.set_application_name("podbeat")
     settings = Gtk.Settings.get_default()
     if settings is not None:
         settings.set_property("gtk-application-prefer-dark-theme", True)
@@ -167,7 +168,7 @@ def run_gtk4() -> None:
         if windows:
             windows[0].present()
             return
-        window = Gtk.ApplicationWindow(application=application, title="podlite")
+        window = Gtk.ApplicationWindow(application=application, title="podbeat")
         window.set_default_size(*WINDOW_SIZE)
         view = WebKit.WebView()
         view.get_settings().set_property("enable-developer-extras", True)
@@ -204,68 +205,6 @@ def run_gtk4() -> None:
     app.run([])
 
 
-def run_gtk3() -> None:
-    import gi
-
-    gi.require_version("Gtk", "3.0")
-    gi.require_version("WebKit2", "4.1")
-    from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2
-
-    GLib.set_prgname("podlite")
-    GLib.set_application_name("podlite")
-    Gdk.set_program_class("podlite")
-    settings = Gtk.Settings.get_default()
-    if settings is not None:
-        settings.set_property("gtk-application-prefer-dark-theme", True)
-
-    app = Gtk.Application(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
-    windows: list = []
-
-    def quit_on_signal(*_args):
-        app.quit()
-        return GLib.SOURCE_REMOVE
-
-    GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, quit_on_signal)
-    GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, quit_on_signal)
-
-    def activate(application):
-        if windows:
-            windows[0].present()
-            return
-        window = Gtk.ApplicationWindow(application=application, title="podlite")
-        window.set_default_size(*WINDOW_SIZE)
-        view = WebKit2.WebView()
-        view.get_settings().set_property("enable-developer-extras", True)
-        view.load_uri(URL)
-        window.add(view)
-        window.show_all()
-
-        keys = Gtk.EventControllerKey()
-
-        def on_key(_controller, keyval, _code, state):
-            ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
-            if ctrl and keyval in (Gdk.KEY_r, Gdk.KEY_R):
-                view.reload()
-                return True
-            if keyval == Gdk.KEY_F11:
-                if window.get_window() and window.get_window().get_state() & Gdk.WindowState.FULLSCREEN:
-                    window.unfullscreen()
-                else:
-                    window.fullscreen()
-                return True
-            if ctrl and keyval in (Gdk.KEY_q, Gdk.KEY_Q):
-                application.quit()
-                return True
-            return False
-
-        keys.connect("key-pressed", on_key)
-        window.add_controller(keys)
-        windows.append(window)
-
-    app.connect("activate", activate)
-    app.run([])
-
-
 def run_browser() -> None:
     for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "brave-browser"):
         exe = shutil.which(name)
@@ -276,7 +215,7 @@ def run_browser() -> None:
             exe,
             f"--app={URL}",
             f"--window-size={width},{height}",
-            "--class=podlite",
+            "--class=podbeat",
             "--no-first-run",
             "--no-default-browser-check",
         ])
@@ -335,7 +274,7 @@ def userns_usable() -> bool:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="podlite desktop window")
+    parser = argparse.ArgumentParser(description="podbeat desktop window")
     parser.add_argument("--browser", action="store_true", help="force a browser window")
     parser.add_argument("--check", action="store_true", help="report the environment and exit")
     args = parser.parse_args()
@@ -349,8 +288,6 @@ def main() -> int:
     try:
         if backend == "gtk4":
             run_gtk4()
-        elif backend == "gtk3":
-            run_gtk3()
         else:
             run_browser()
     except KeyboardInterrupt:

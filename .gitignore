@@ -2,9 +2,15 @@ __pycache__/
 *.py[cod]
 *.log
 
-# local state (restart history, server log) lives in ~/.podlite, never here
+# local state (restart history, server log) lives in ~/.podbeat, never here
+.podbeat/
 .podlite/
 *.jsonl
+
+# stray agent-tool scratch dirs sometimes created next to projects
+.agents/
+.aws/
+.codex/
 
 .venv/
 venv/

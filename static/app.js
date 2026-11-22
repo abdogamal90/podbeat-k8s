@@ -1,7 +1,7 @@
 'use strict';
 
 /* ==========================================================================
-   podlite ui - no framework, no build step. state in, html out.
+   podbeat ui - no framework, no build step. state in, html out.
    ========================================================================== */
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -29,6 +29,8 @@ const state = {
   sort: { pods: { key: 'upSec', dir: 1 }, default: { key: 'name', dir: 1 } },
   tick: 0,
   stuck: false,
+  token: '',
+  prodPattern: 'prod',
 };
 
 const TAB_ORDER = ['pods', 'nodes', 'deployments', 'services', 'configmaps', 'secrets', 'events', 'restarts'];
@@ -46,7 +48,7 @@ const DRAWER_TABS = {
 function esc(value) {
   return String(value == null ? '' : value)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 function fmtAge(sec) {
@@ -82,8 +84,11 @@ function restartClass(n) {
   return n === 0 ? 'r0' : n < 3 ? 'r1' : 'r2';
 }
 
-async function api(path, opts) {
-  const res = await fetch(path, opts);
+async function api(path, opts = {}) {
+  // every call carries the per-launch token from /api/health; without it the
+  // server refuses /api/* (that is what stops other websites from driving us)
+  const headers = Object.assign({ 'X-Podbeat-Token': state.token }, opts.headers || {});
+  const res = await fetch(path, Object.assign({}, opts, { headers }));
   const type = res.headers.get('content-type') || '';
   const body = type.includes('json') ? await res.json() : await res.text();
   if (!res.ok) throw new Error((body && body.error) || body || res.statusText);
@@ -308,6 +313,13 @@ function isProblem(status) {
   return !['Running', 'Completed', 'Succeeded'].includes(status);
 }
 
+// PRODUCTION marker: matches the context name against the server-provided
+// pattern (PODBEAT_PROD_PATTERN, default "prod"), so no account is hardcoded.
+function isProdContext() {
+  const pattern = state.prodPattern || '';
+  return pattern.length > 0 && state.ctx.toLowerCase().includes(pattern.toLowerCase());
+}
+
 function rbacBlocked(message) {
   return /forbidden|RBAC/i.test(message || '');
 }
@@ -315,12 +327,12 @@ function rbacBlocked(message) {
 function blockedPanel(what, message) {
   return `
     <div class="empty">
-      <div style="font-size:14px;color:var(--fg);margin-bottom:8px">${esc(what)} are blocked for your IAM user</div>
+      <div style="font-size:14px;color:var(--fg);margin-bottom:8px">${esc(what)} are blocked for your user</div>
       <div style="font-family:var(--mono);font-size:11px;color:var(--dim);margin-bottom:12px">${esc(message)}</div>
       <div style="font-size:12px;color:var(--dim);max-width:640px;margin:0 auto;line-height:1.6">
-        That's an RBAC limit on <code>cartona-developers</code>, not a podlite bug.<br>
+        That's an RBAC limit on your cluster user, not a podbeat bug.<br>
         Everything else still works: pods, logs, nodes, deploys, services, configmaps.<br>
-        Restart history comes from podlite's own watcher, so you don't need events for that.
+        Restart history comes from podbeat's own watcher, so you don't need events for that.
       </div>
     </div>`;
 }
@@ -440,7 +452,7 @@ async function renderRestarts() {
   const cols = [
     { key: 'ts', label: 'when', cls: 'mono', render: e => `${fmtAge(Math.floor(Date.now() / 1000) - e.ts)} ago`, title: e => new Date(e.ts * 1000).toLocaleString() },
     { key: 'ns', label: 'ns', cls: 'mono' },
-    { key: 'pod', label: 'pod', cls: 'name', render: e => esc(e.pod) + (e.historical ? ' <span class="tag" title="read from the pod\'s last state when podlite started">prior</span>' : '') },
+    { key: 'pod', label: 'pod', cls: 'name', render: e => esc(e.pod) + (e.historical ? ' <span class="tag" title="read from the pod\'s last state when podbeat started">prior</span>' : '') },
     { key: 'container', label: 'container', cls: 'mono' },
     { key: 'reason', label: 'reason', render: e => `<span class="${e.reason === 'Completed' ? 's-done' : 's-bad'}">${esc(e.reason)}</span>` },
     { key: 'exitCode', label: 'exit', num: true, render: e => e.exitCode == null ? '-' : esc(e.exitCode) },
@@ -812,12 +824,12 @@ function invalidateObject(sel) {
 function renderConfigMapView(sel, obj) {
   const entries = Object.entries(obj.data || {});
   const rv = obj.metadata?.resourceVersion || '';
-  const why = obj.immutable ? 'immutable configmap' : !state.writes ? 'read-only mode: restart with PODLITE_ALLOW_WRITES=1' : 'edit keys';
+  const why = obj.immutable ? 'immutable configmap' : !state.writes ? 'read-only mode: restart with PODBEAT_ALLOW_WRITES=1' : 'edit keys';
   $('#d-body').innerHTML = `
     <div class="toolbar">
       <span class="muted">${entries.length} keys</span>
       ${obj.immutable ? '<span class="tag warn">immutable</span>' : ''}
-      ${state.writes ? '' : '<span class="tag" title="restart with PODLITE_ALLOW_WRITES=1, or ./install.sh --writes">read-only</span>'}
+      ${state.writes ? '' : '<span class="tag" title="restart with PODBEAT_ALLOW_WRITES=1, or ./install.sh --writes">read-only</span>'}
       <span class="spacer"></span>
       <button class="btn" id="cm-edit" ${state.writes && !obj.immutable ? '' : 'disabled'} title="${esc(why)}">edit</button>
       <button class="btn" id="copy-all">copy all</button>
@@ -847,7 +859,7 @@ function renderConfigMapEditor(sel, obj, rv) {
   const body = $('#d-body');
   body.innerHTML = `
     <div class="toolbar">
-      <span class="muted">editing <b>${esc(sel.name)}</b> · ${state.ctx.includes('188113730724') ? 'PRODUCTION' : 'this cluster'}</span>
+      <span class="muted">editing <b>${esc(sel.name)}</b> · ${isProdContext() ? 'PRODUCTION' : 'this cluster'}</span>
       <span class="spacer"></span>
       <button class="btn" id="cm-add">+ key</button>
       <button class="btn" id="cm-cancel">cancel</button>
@@ -955,7 +967,7 @@ async function mountPodRestarts(sel) {
     const events = data.events.filter(e => e.pod === sel.name && e.ns === sel.ns).reverse();
     if (!events.length) {
       body.innerHTML = `<div class="empty">no restarts recorded for this pod<br>
-        <span class="muted">podlite records every restart it sees while running, plus the watcher in ${esc((state.watch || []).join(', '))}</span></div>`;
+        <span class="muted">podbeat records every restart it sees while running, plus the watcher in ${esc((state.watch || []).join(', '))}</span></div>`;
       return;
     }
     body.innerHTML = `<table><thead><tr><th>when</th><th>container</th><th>reason</th><th class="num">exit</th><th class="num">ran for</th><th class="num">count</th></tr></thead><tbody>
@@ -967,7 +979,7 @@ async function mountPodRestarts(sel) {
         <td class="num mono">${fmtDur(e.ranForSec)}</td>
         <td class="num mono">+${e.delta} → ${e.total}</td>
       </tr>`).join('')}</tbody></table>
-      <div class="muted" style="margin-top:8px">restart history is podlite's own record; k8s events are not required.</div>`;
+      <div class="muted" style="margin-top:8px">restart history is podbeat's own record; k8s events are not required.</div>`;
   } catch (err) {
     body.innerHTML = `<div class="empty">${esc(err.message)}</div>`;
   }
@@ -1010,7 +1022,10 @@ function mountLogs(sel) {
       previous: $('#log-prev').checked ? '1' : '0',
       timestamps: $('#log-ts').checked ? '1' : '0',
     });
-    fetch('/api/logs?' + params, { signal: controller.signal }).then(async res => {
+    fetch('/api/logs?' + params, {
+      signal: controller.signal,
+      headers: { 'X-Podbeat-Token': state.token },
+    }).then(async res => {
       if (!res.ok) { out.textContent = await res.text(); status.textContent = ''; return; }
       status.textContent = $('#log-follow').checked ? 'streaming' : 'loaded';
       const reader = res.body.getReader();
@@ -1041,7 +1056,7 @@ function mountLogs(sel) {
 function mountActions(sel) {
   const body = $('#d-body');
   const ro = state.writes ? '' : 'disabled';
-  const roNote = state.writes ? '' : '<div class="muted" style="margin-bottom:10px">read-only mode. restart with <code>PODLITE_ALLOW_WRITES=1</code> to unlock writes.</div>';
+  const roNote = state.writes ? '' : '<div class="muted" style="margin-bottom:10px">read-only mode. restart with <code>PODBEAT_ALLOW_WRITES=1</code> to unlock writes.</div>';
 
   if (sel.kind === 'pods') {
     body.innerHTML = `
@@ -1128,7 +1143,7 @@ $('#d-body').addEventListener('click', async (e) => {
   if (act === 'scale') {
     const replicas = $('#scale-replicas').value.trim();
     if (!/^\d+$/.test(replicas)) return toast('<div class="t-pod">replicas must be a number</div>');
-    if (!await uiConfirm(`Scale ${sel.name} to ${replicas}?`, `This changes live replica count in ${state.ctx.includes('188113730724') ? 'PRODUCTION' : 'this cluster'}.`)) return;
+    if (!await uiConfirm(`Scale ${sel.name} to ${replicas}?`, `This changes live replica count in ${isProdContext() ? 'PRODUCTION' : 'this cluster'}.`)) return;
     return runAction('scale', { kind: btn.dataset.kind, name: sel.name, replicas }, 'scaled');
   }
   if (act === 'pf-start') {
@@ -1149,6 +1164,8 @@ $('#d-body').addEventListener('click', async (e) => {
   if (act === 'exec') {
     const cmd = $('#exec-cmd').value.trim();
     if (!cmd) return;
+    // exec is the one action with no undo; confirm it when the marker says prod
+    if (isProdContext() && !await uiConfirm(`Run in ${sel.name}?`, `This executes a shell command in a PRODUCTION pod:\n${cmd.slice(0, 200)}`)) return;
     const out = $('#exec-out');
     out.textContent = '$ ' + cmd + '\n…';
     try {
@@ -1269,12 +1286,14 @@ async function boot() {
     const health = await api('/api/health');
     state.writes = health.writes;
     state.watch = health.watch;
+    state.prodPattern = health.prodPattern;
+    state.token = health.token;
     const pill = $('#writes');
     pill.textContent = health.writes ? 'write mode' : 'read-only';
     pill.className = 'pill ' + (health.writes ? 'rw' : 'ro');
     pill.title = health.writes
       ? 'delete / restart / scale / exec are enabled'
-      : 'view only. restart podlite with PODLITE_ALLOW_WRITES=1 to unlock';
+      : 'view only. restart podbeat with PODBEAT_ALLOW_WRITES=1 to unlock';
 
     await loadContexts();
     await loadNamespaces();
