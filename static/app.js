@@ -84,6 +84,17 @@ function restartClass(n) {
   return n === 0 ? 'r0' : n < 3 ? 'r1' : 'r2';
 }
 
+// The signature: an EKG blip per restart. Old restarts sit still, a restart in
+// the last hour traces live, and a quiet namespace flatlines.
+const BEAT_PATH = 'M1 7 L4 7 L5.5 3.2 L7 10.4 L8.6 7 L14 7';
+const FLAT_PATH = 'M1 7 L14 7';
+
+function beatGlyph(live, cls = '') {
+  const path = cls === 'flat' ? FLAT_PATH : BEAT_PATH;
+  const classes = `beat ${cls}${live ? ' live' : ''}`;
+  return `<svg class="${classes}" viewBox="0 0 15 14" width="15" height="10" aria-hidden="true"><path d="${path}"/></svg>`;
+}
+
 async function api(path, opts = {}) {
   // every call carries the per-launch token from /api/health; without it the
   // server refuses /api/* (that is what stops other websites from driving us)
@@ -243,8 +254,13 @@ async function loadForwards() {
 
 /* ---------- table helper ---------- */
 
-function table(columns, rows, opts = {}) {
-  const sort = opts.sortKey ? state.sort[opts.sortKey] : null;
+// loading state: quiet shimmering rows instead of a spinner
+function skeletonTable(cells = 9, rows = 14) {
+  const row = `<tr class="skeleton">${'<td></td>'.repeat(cells)}</tr>`;
+  return `<table><tbody>${row.repeat(rows)}</tbody></table>`;
+}
+
+function table(columns, rows, opts = {}) {  const sort = opts.sortKey ? state.sort[opts.sortKey] : null;
   const col = sort && columns.find(c => c.key === sort.key);
   const html = [];
   html.push('<table><thead><tr>');
@@ -368,8 +384,11 @@ function renderPods() {
     },
     { key: 'readyText', label: 'ready', cls: 'mono' },
     {
-      key: 'restarts', label: 'restarts', num: true, render: p =>
-        `<span class="${restartClass(p.restarts)}">${p.restarts}</span>`
+      key: 'restarts', label: 'restarts', num: true, render: p => {
+        if (!p.restarts) return `<span class="r0">${beatGlyph(false, 'flat')}0</span>`;
+        const fresh = p.lastRestartAgoSec > 0 && p.lastRestartAgoSec < 3600;
+        return `<span class="${restartClass(p.restarts)}">${beatGlyph(fresh, fresh ? '' : (p.lastRestartAgoSec < 86400 ? 'warn' : ''))}${p.restarts}</span>`;
+      }
     },
     {
       key: 'lastRestartAgoSec', label: 'last restart', cls: 'mono', render: p => {
@@ -450,18 +469,20 @@ async function renderRestarts() {
   const events = data.events.slice().reverse().filter(e => !state.ns || e.ns === state.ns || e.ns === '');
   state.rows = events;
   const cols = [
-    { key: 'ts', label: 'when', cls: 'mono', render: e => `${fmtAge(Math.floor(Date.now() / 1000) - e.ts)} ago`, title: e => new Date(e.ts * 1000).toLocaleString() },
+    { key: 'ts', label: 'when', cls: 'mono', render: e => {
+      const fresh = e.ts > Math.floor(Date.now() / 1000) - 3600;
+      return `${beatGlyph(fresh, fresh ? '' : 'flat')}${fmtAge(Math.floor(Date.now() / 1000) - e.ts)} ago`;
+    }, title: e => new Date(e.ts * 1000).toLocaleString() },
     { key: 'ns', label: 'ns', cls: 'mono' },
     { key: 'pod', label: 'pod', cls: 'name', render: e => esc(e.pod) + (e.historical ? ' <span class="tag" title="read from the pod\'s last state when podbeat started">prior</span>' : '') },
     { key: 'container', label: 'container', cls: 'mono' },
-    { key: 'reason', label: 'reason', render: e => `<span class="${e.reason === 'Completed' ? 's-done' : 's-bad'}">${esc(e.reason)}</span>` },
-    { key: 'exitCode', label: 'exit', num: true, render: e => e.exitCode == null ? '-' : esc(e.exitCode) },
+    { key: 'reason', label: 'reason', render: e => `<span class="${e.reason === 'Completed' ? 's-done' : 's-bad'}">${esc(e.reason)}</span>` },    { key: 'exitCode', label: 'exit', num: true, render: e => e.exitCode == null ? '-' : esc(e.exitCode) },
     { key: 'ranForSec', label: 'ran for', num: true, render: e => fmtDur(e.ranForSec) },
     { key: 'delta', label: 'restarts', num: true, render: e => `+${e.delta} → ${e.total}` },
   ];
   $('#view').innerHTML = events.length
     ? table(cols, events, { sortKey: 'restarts' })
-    : `<div class="empty">no restarts recorded yet.<br><span class="muted">watcher is polling namespace(s): ${esc((state.watch || ['default']).join(', '))}</span></div>`;
+    : `<div class="empty">${beatGlyph(false, 'flat')} steady — no restarts recorded<br><span class="muted">watcher is polling namespace(s): ${esc((state.watch || ['default']).join(', '))}</span></div>`;
   bindTable(e => {
     state.ns = e.ns;
     $('#ns').value = e.ns;
@@ -557,7 +578,7 @@ async function render() {
   try {
     if (state.tab === 'pods') { renderPods(); }
     else if (state.tab === 'nodes') {
-      if (!state.nodes.length) $('#view').innerHTML = '<div class="empty">loading nodes…</div>';
+      if (!state.nodes.length) $('#view').innerHTML = skeletonTable(9);
       const data = await api(`/api/nodes?ctx=${encodeURIComponent(state.ctx)}&ns=${encodeURIComponent(state.ns)}`);
       state.nodes = data.nodes; state.nodeNote = data.note;
       renderNodes();
@@ -1027,7 +1048,7 @@ function mountLogs(sel) {
       headers: { 'X-Podbeat-Token': state.token },
     }).then(async res => {
       if (!res.ok) { out.textContent = await res.text(); status.textContent = ''; return; }
-      status.textContent = $('#log-follow').checked ? 'streaming' : 'loaded';
+      status.innerHTML = $('#log-follow').checked ? '<span class="live-dot"></span>LIVE' : 'loaded';
       const reader = res.body.getReader();
       const dec = new TextDecoder();
       for (;;) {
@@ -1282,6 +1303,7 @@ async function tick() {
 /* ---------- boot ---------- */
 
 async function boot() {
+  $('#view').innerHTML = skeletonTable();
   try {
     const health = await api('/api/health');
     state.writes = health.writes;

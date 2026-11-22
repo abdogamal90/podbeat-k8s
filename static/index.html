@@ -5,11 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>podbeat</title>
 <link rel="stylesheet" href="/static/style.css">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>🥔</text></svg>">
+<link rel="icon" href="/static/icon.svg">
 </head>
 <body>
 <header>
-  <span class="brand">podbeat</span>
+  <span class="brand">podbeat<span class="brand-pulse" aria-hidden="true"></span></span>
   <select id="ctx" title="kubectl context"></select>
   <select id="ns" title="namespace"></select>
   <input id="search" type="search" placeholder="filter…  (press /)" autocomplete="off" spellcheck="false">
@@ -33,7 +33,7 @@
 
 <div id="banner" class="banner" hidden></div>
 
-<main id="view"><div class="empty">loading…</div></main>
+<main id="view"></main>
 
 <aside id="drawer" hidden>
   <div class="drawer-head">

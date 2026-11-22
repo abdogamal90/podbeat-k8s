@@ -29,6 +29,7 @@ SERVER = HERE / "podbeat.py"
 PORT = int(os.environ.get("PODBEAT_PORT", "8484"))
 URL = f"http://127.0.0.1:{PORT}/"
 APP_ID = "io.github.abdogamal90.podbeat"
+VERSION = "0.1.0"  # keep in sync with podbeat.py
 HOME_DIR = Path(os.environ.get("PODBEAT_HOME", Path.home() / ".podbeat"))
 SERVER_LOG = HOME_DIR / "server.log"
 START_TIMEOUT = 20.0
@@ -126,7 +127,20 @@ def stop_server(proc: subprocess.Popen | None) -> None:
 
 def detect_backend() -> str:
     try:
-        import gi  # optional dependency, probed at runtime
+        import gi  # optional dependencies, probed at runtime
+
+        gi.require_version("Gtk", "4.0")
+        gi.require_version("Adw", "1")
+        gi.require_version("WebKit", "6.0")
+        import importlib
+
+        importlib.import_module("gi.repository.Adw")
+        importlib.import_module("gi.repository.WebKit")
+        return "adw"
+    except Exception:
+        pass
+    try:
+        import gi
 
         gi.require_version("Gtk", "4.0")
         gi.require_version("WebKit", "6.0")
@@ -137,6 +151,165 @@ def detect_backend() -> str:
     except Exception:
         pass
     return "browser"
+
+
+def build_shortcuts_window(window) -> object:
+    """GNOME-native shortcut help (Gtk.ShortcutsWindow, Ctrl+Shift+question)."""
+    import gi
+
+    gi.require_version("Gtk", "4.0")
+    from gi.repository import Gtk
+
+    def shortcut(trigger, title):
+        s = Gtk.ShortcutsShortcut()
+        s.set_property("accelerator", trigger)
+        s.set_property("title", title)
+        return s
+
+    def group(title, items):
+        g = Gtk.ShortcutsGroup()
+        g.set_property("title", title)
+        for item in items:
+            g.append(shortcut(*item))
+        return g
+
+    section = Gtk.ShortcutsSection(section_name="shortcuts", title="Keyboard Shortcuts")
+    section.append(group("Window", [
+        ("<Primary>r", "Reload"),
+        ("F11", "Fullscreen"),
+        ("<Primary>q", "Quit"),
+        ("<Primary><Shift>i", "Web inspector"),
+    ]))
+    section.append(group("Dashboard", [
+        ("slash", "Filter"),
+        ("1…8", "Switch tab"),
+        ("j", "Move selection down"),
+        ("k", "Move selection up"),
+        ("Return", "Open details"),
+        ("l", "Pod logs"),
+        ("y", "YAML"),
+        ("d", "Describe"),
+        ("c", "Collapse detail panel"),
+        ("r", "Refresh"),
+        ("Escape", "Close panel"),
+    ]))
+    shortcuts = Gtk.ShortcutsWindow(transient_for=window, modal=True)
+    shortcuts.add_section(section)
+    return shortcuts
+
+
+def run_adw() -> None:
+    """GNOME-native window: libadwaita chrome, header bar, shortcuts, about."""
+    import gi
+
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    gi.require_version("WebKit", "6.0")
+    from gi.repository import Adw, Gdk, Gio, GLib, Gtk, WebKit
+
+    GLib.set_prgname("podbeat")
+    GLib.set_application_name("podbeat")
+    # the web UI is dark by design; keep the GTK chrome in the same tone
+    Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.PREFER_DARK)
+
+    app = Adw.Application(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+    windows: list = []
+
+    def quit_on_signal(*_args):
+        # let the main loop unwind so the server child is stopped cleanly
+        app.quit()
+        return GLib.SOURCE_REMOVE
+
+    GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, quit_on_signal)
+    GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, quit_on_signal)
+
+    def show_about(window):
+        about = Adw.AboutWindow(transient_for=window)
+        about.set_application_name("podbeat")
+        about.set_version(VERSION)
+        about.set_developer_name("abdogamal90")
+        about.set_comments("Tiny kubectl dashboard: pods, nodes, restarts — no bloat.")
+        about.set_website("https://github.com/abdogamal90/podbeat-k8s")
+        about.set_issue_url("https://github.com/abdogamal90/podbeat-k8s/issues")
+        about.set_application_icon("podbeat")
+        about.present()
+
+    def activate(application):
+        # clicking the icon again must focus the window, not spawn a second one
+        if windows:
+            windows[0].present()
+            return
+        window = Adw.ApplicationWindow(application=application)
+        window.set_title("podbeat")
+        window.set_default_size(*WINDOW_SIZE)
+
+        view = WebKit.WebView()
+        view.get_settings().set_property("enable-developer-extras", True)
+        view.load_uri(URL)
+
+        header = Adw.HeaderBar()
+        toolbar = Adw.ToolbarView()
+        toolbar.add_top_bar(header)
+        toolbar.set_content(view)
+        window.set_content(toolbar)
+
+        reload_button = Gtk.Button.new_from_icon_name("view-refresh-symbolic")
+        reload_button.set_tooltip_text("Reload")
+        reload_button.connect("clicked", lambda *_: view.reload())
+        header.pack_start(reload_button)
+
+        menu = Gio.Menu()
+        menu.append("Keyboard Shortcuts", "win.shortcuts")
+        menu.append("About podbeat", "win.about")
+        menu_button = Gtk.MenuButton()
+        menu_button.set_icon_name("open-menu-symbolic")
+        menu_button.set_tooltip_text("Main Menu")
+        menu_button.set_menu_model(menu)
+        header.pack_end(menu_button)
+
+        shortcuts_window = build_shortcuts_window(window)
+
+        actions = {
+            "shortcuts": lambda *_: shortcuts_window.present(),
+            "about": lambda *_: show_about(window),
+        }
+        for name, callback in actions.items():
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", callback)
+            window.add_action(action)
+
+        keys = Gtk.EventControllerKey()
+
+        def on_key(_controller, keyval, _code, state):
+            ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
+            shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
+            if ctrl and keyval in (Gdk.KEY_r, Gdk.KEY_R):
+                view.reload()
+                return True
+            if keyval == Gdk.KEY_F11:
+                window.set_fullscreened(not window.get_fullscreened())
+                return True
+            if ctrl and keyval in (Gdk.KEY_q, Gdk.KEY_Q):
+                application.quit()
+                return True
+            if ctrl and shift and keyval in (Gdk.KEY_I, Gdk.KEY_i):
+                try:
+                    view.get_inspector().show()
+                except Exception:
+                    pass
+                return True
+            if ctrl and shift and keyval in (Gdk.KEY_question, Gdk.KEY_slash):
+                shortcuts_window.present()
+                return True
+            return False
+
+        keys.connect("key-pressed", on_key)
+        window.add_controller(keys)
+        window.present()
+        windows.append(window)
+
+    app.connect("activate", activate)
+    app.run([])
 
 
 def run_gtk4() -> None:
@@ -286,7 +459,9 @@ def main() -> int:
     backend = "browser" if args.browser else detect_backend()
     proc = start_server()
     try:
-        if backend == "gtk4":
+        if backend == "adw":
+            run_adw()
+        elif backend == "gtk4":
             run_gtk4()
         else:
             run_browser()
