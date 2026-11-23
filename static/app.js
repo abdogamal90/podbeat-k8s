@@ -754,10 +754,10 @@ function podOverview(sel) {
 async function mountObjectOverview(sel) {
   const body = $('#d-body');
   body.innerHTML = '<div class="empty">loading…</div>';
-  const key = `obj:${sel.kind}:${sel.ns}:${sel.name}`;
+  const key = `obj:${state.ctx}:${sel.kind}:${sel.ns}:${sel.name}`;
   try {
     const data = state.detail[key] || (state.detail[key] = await api(
-      `/api/object?kind=${sel.kind}&ns=${encodeURIComponent(sel.ns)}&name=${encodeURIComponent(sel.name)}`));
+      `/api/object?kind=${sel.kind}&ctx=${encodeURIComponent(state.ctx)}&ns=${encodeURIComponent(sel.ns)}&name=${encodeURIComponent(sel.name)}`));
     const obj = data.object || {};
     const spec = obj.spec || {};
     const status = obj.status || {};
@@ -788,7 +788,7 @@ async function mountData(sel) {
   body.innerHTML = '<div class="empty">loading…</div>';
   try {
     if (sel.kind === 'secrets') {
-      const data = await api(`/api/secret?ns=${encodeURIComponent(sel.ns)}&name=${encodeURIComponent(sel.name)}`);
+      const data = await api(`/api/secret?ctx=${encodeURIComponent(state.ctx)}&ns=${encodeURIComponent(sel.ns)}&name=${encodeURIComponent(sel.name)}`);
       const entries = Object.entries(data.data || {});
       body.innerHTML = `
         <div class="toolbar">
@@ -809,9 +809,9 @@ async function mountData(sel) {
       };
       return;
     }
-    const key = `obj:${sel.kind}:${sel.ns}:${sel.name}`;
+    const key = `obj:${state.ctx}:${sel.kind}:${sel.ns}:${sel.name}`;
     const data = state.detail[key] || (state.detail[key] = await api(
-      `/api/object?kind=${sel.kind}&ns=${encodeURIComponent(sel.ns)}&name=${encodeURIComponent(sel.name)}`));
+      `/api/object?kind=${sel.kind}&ctx=${encodeURIComponent(state.ctx)}&ns=${encodeURIComponent(sel.ns)}&name=${encodeURIComponent(sel.name)}`));
     const obj = data.object || {};
     if (sel.kind === 'configmaps') return renderConfigMapView(sel, obj);
     const entries = Object.entries(obj.data || {});
@@ -961,10 +961,10 @@ function renderConfigMapEditor(sel, obj, rv) {
 async function mountText(sel, kind) {
   const body = $('#d-body');
   body.innerHTML = '<div class="empty">loading…</div>';
-  const key = `${kind}:${sel.kind}:${sel.ns}:${sel.name}`;
+  const key = `${kind}:${state.ctx}:${sel.kind}:${sel.ns}:${sel.name}`;
   try {
     const text = state.detail[key] || (state.detail[key] = await api(
-      `/api/${kind}?kind=${sel.kind}&ns=${encodeURIComponent(sel.ns)}&name=${encodeURIComponent(sel.name)}`));
+      `/api/${kind}?kind=${sel.kind}&ctx=${encodeURIComponent(state.ctx)}&ns=${encodeURIComponent(sel.ns)}&name=${encodeURIComponent(sel.name)}`));
     body.innerHTML = `
       <div class="toolbar">
         <span class="muted">${esc(kind)} · ${text.split('\n').length} lines</span>
